@@ -356,33 +356,68 @@ with tab_facebook:
         for i, ad in enumerate(facebook_result["ads"]):
             label = ad.get("page_name") or f"Ad {i+1}"
             with st.expander(f"Ad {i+1}: {label}"):
-                col_img, col_info = st.columns([1, 2])
-                with col_img:
-                    screenshot = ad.get("screenshot_bytes")
-                    if screenshot:
-                        st.image(screenshot, use_column_width=True)
-                    elif ad.get("image_url"):
+                # --- Ad info header ---
+                if ad.get("page_name"):
+                    st.markdown(f"**Page:** {ad['page_name']}")
+                if ad.get("paid_for_by"):
+                    st.markdown(f"**Paid for by:** {ad['paid_for_by']}")
+                if ad.get("body"):
+                    st.markdown(f"**Body:** {ad['body']}")
+                if ad.get("start_date"):
+                    st.markdown(f"**Started:** {ad['start_date']}")
+                if ad.get("platforms"):
+                    st.markdown(f"**Platforms:** {ad['platforms']}")
+                if ad.get("library_id"):
+                    st.markdown(f"**Library ID:** `{ad['library_id']}`")
+
+                flag = ad.get("agency_flag")
+                if flag and flag.get("is_agency"):
+                    st.warning(
+                        f"Agency flag ({flag['confidence']}): {flag['reason']}"
+                    )
+
+                # --- Full card screenshot ---
+                screenshot = ad.get("screenshot_bytes")
+                if screenshot:
+                    st.markdown("**Ad Preview (full card):**")
+                    st.image(screenshot, use_column_width=True)
+
+                # --- Creative images ---
+                creatives = ad.get("creative_images", [])
+                if creatives:
+                    st.markdown(f"**Ad Creatives ({len(creatives)} images):**")
+                    # Show up to 4 images per row
+                    for row_start in range(0, len(creatives), 4):
+                        row_imgs = creatives[row_start:row_start + 4]
+                        cols = st.columns(len(row_imgs))
+                        for col, img_url in zip(cols, row_imgs):
+                            with col:
+                                try:
+                                    st.image(img_url, use_column_width=True)
+                                except Exception:
+                                    st.caption("Image failed to load")
+                elif not screenshot:
+                    # Fallback: single image_url
+                    if ad.get("image_url"):
                         st.image(ad["image_url"], use_column_width=True)
                     else:
-                        st.caption("No image available")
+                        st.caption("No images available")
 
-                with col_info:
-                    if ad.get("page_name"):
-                        st.markdown(f"**Page:** {ad['page_name']}")
-                    if ad.get("paid_for_by"):
-                        st.markdown(f"**Paid for by:** {ad['paid_for_by']}")
-                    if ad.get("body"):
-                        st.markdown(f"**Body:** {ad['body']}")
-                    if ad.get("start_date"):
-                        st.markdown(f"**Started:** {ad['start_date']}")
-                    if ad.get("platforms"):
-                        st.markdown(f"**Platforms:** {ad['platforms']}")
-
-                    flag = ad.get("agency_flag")
-                    if flag and flag.get("is_agency"):
-                        st.warning(
-                            f"Agency flag ({flag['confidence']}): {flag['reason']}"
-                        )
+                # --- Carousel slides ---
+                slides = ad.get("carousel_cards", [])
+                if slides:
+                    st.markdown(f"**Carousel Slides ({len(slides)}):**")
+                    for j, slide in enumerate(slides, 1):
+                        headline = slide.get("headline", "")
+                        desc = slide.get("description", "")
+                        cta = slide.get("cta", "")
+                        link = slide.get("link_url", "")
+                        parts = [f"**{j}.** {headline}"]
+                        if desc:
+                            parts.append(f" — {desc}")
+                        if cta:
+                            parts.append(f" [{cta}]")
+                        st.markdown("".join(parts))
     else:
         st.info("No Facebook ads found for this brand.")
 

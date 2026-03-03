@@ -80,19 +80,33 @@ def _run_in_subprocess(search_term: str, max_ads: int, progress_cb) -> dict:
     This avoids the Windows asyncio NotImplementedError that occurs when
     Playwright tries to spawn a subprocess inside Streamlit's event loop.
     We use subprocess.Popen (not multiprocessing) for maximum isolation.
+
+    Card screenshots are saved as PNG files in a temp directory and their
+    paths are returned in each ad dict.
     """
     import subprocess, sys
 
     result_file = Path(tempfile.mktemp(suffix=".json", prefix="fb_result_"))
+    screenshot_dir = Path(tempfile.mkdtemp(prefix="fb_screenshots_"))
     this_file = Path(__file__).resolve()
 
-    # Build a small Python script that imports this module and runs the search
+    # Build worker script that runs the search and saves screenshots
     script = (
-        f"import sys, json; sys.path.insert(0, {str(this_file.parent.parent)!r});\n"
-        f"from core.facebook_scraper import _try_facebook_search;\n"
-        f"r = _try_facebook_search({search_term!r}, {max_ads!r}, None);\n"
-        f"[a.pop('screenshot_bytes', None) or a.pop('thumbnail_bytes', None) for a in r.get('ads', [])];\n"
-        f"open({str(result_file)!r}, 'w', encoding='utf-8').write(json.dumps(r, default=str, ensure_ascii=False))\n"
+        f"import sys, json, base64\n"
+        f"from pathlib import Path\n"
+        f"sys.path.insert(0, {str(this_file.parent.parent)!r})\n"
+        f"from core.facebook_scraper import _try_facebook_search\n"
+        f"r = _try_facebook_search({search_term!r}, {max_ads!r}, None)\n"
+        f"sd = Path({str(screenshot_dir)!r})\n"
+        f"for i, ad in enumerate(r.get('ads', [])):\n"
+        f"    sb = ad.pop('screenshot_bytes', None)\n"
+        f"    ad.pop('thumbnail_bytes', None)\n"
+        f"    if sb:\n"
+        f"        p = sd / f'card_{{i}}.png'\n"
+        f"        p.write_bytes(sb)\n"
+        f"        ad['screenshot_path'] = str(p)\n"
+        f"Path({str(result_file)!r}).write_text(\n"
+        f"    json.dumps(r, default=str, ensure_ascii=False), encoding='utf-8')\n"
     )
 
     try:
@@ -102,7 +116,6 @@ def _run_in_subprocess(search_term: str, max_ads: int, progress_cb) -> dict:
             stderr=subprocess.PIPE,
         )
 
-        # Poll for completion, updating the progress callback
         elapsed = 0
         while proc.poll() is None and elapsed < 120:
             time.sleep(3)
@@ -120,12 +133,22 @@ def _run_in_subprocess(search_term: str, max_ads: int, progress_cb) -> dict:
             return _error_result(f"Facebook subprocess failed (exit {proc.returncode}): {stderr}")
 
         data = json.loads(result_file.read_text(encoding="utf-8"))
+
+        # Load screenshot PNGs back into bytes for Streamlit display
+        for ad in data.get("ads", []):
+            sp = ad.pop("screenshot_path", None)
+            if sp and Path(sp).exists():
+                ad["screenshot_bytes"] = Path(sp).read_bytes()
+
         return data
 
     except Exception as e:
         return _error_result(f"Failed to launch Facebook subprocess: {e}")
     finally:
         result_file.unlink(missing_ok=True)
+        # Clean up screenshot temp files
+        import shutil
+        shutil.rmtree(screenshot_dir, ignore_errors=True)
 
 
 def _build_search_terms(brand_name: str, domain: str, google_advertiser_name: str = None) -> list:
@@ -435,10 +458,10 @@ def _find_ad_cards(page) -> list:
 
     Facebook's Ad Library renders ads in a grid. Each ad card contains
     'Library ID:' text. We walk up from that text node to find the
-    container that includes the full ad (body, images) — typically ~7
-    levels up, where 'Sponsored' text appears and length is 200-3000.
+    container that includes the full ad (body, images, carousel) —
+    typically ~7 levels up, where 'Sponsored' text appears.
+    Cards with large carousels can be up to ~5000 chars.
     """
-    # Primary: JS-based walk from "Library ID:" text to find card containers
     try:
         card_handles = page.evaluate_handle('''() => {
             const cards = [];
@@ -449,7 +472,7 @@ def _find_ad_cards(page) -> list:
                     for (let i = 0; i < 10; i++) {
                         if (!el || !el.parentElement) break;
                         const text = el.innerText || '';
-                        if (text.includes('Sponsored') && text.length > 200 && text.length < 3000) {
+                        if (text.includes('Sponsored') && text.length > 200 && text.length < 6000) {
                             cards.push(el);
                             break;
                         }
@@ -486,59 +509,13 @@ def _find_ad_cards(page) -> list:
     return []
 
 
-def _extract_ads_from_page_text(page) -> list:
-    """Last-resort: parse ads from the full page text."""
-    try:
-        text = page.inner_text("body")
-        ads = []
-
-        parts = text.split("Started running on")
-        for i, part in enumerate(parts[1:], 1):
-            prev_part = parts[i - 1] if i - 1 < len(parts) else ""
-            lines = [l.strip() for l in prev_part.split("\n") if l.strip()]
-
-            date_match = re.match(r"\s*(\w+ \d+, \d{4})", part)
-            start_date = date_match.group(1) if date_match else None
-
-            # Extract Library ID from current part
-            lib_id_match = re.search(r"Library ID:\s*(\d+)", prev_part)
-            library_id = lib_id_match.group(1) if lib_id_match else None
-
-            page_name = None
-            body = None
-            for line in reversed(lines[-15:]):
-                if len(line) > 5 and not any(
-                    skip in line.lower()
-                    for skip in ["see ad details", "about this ad", "active", "library id",
-                                 "platforms", "filters", "sort by"]
-                ):
-                    if not body and len(line) > 20:
-                        body = line
-                    elif not page_name and len(line) < 80:
-                        page_name = line
-
-            if body or page_name:
-                ads.append({
-                    "page_name": page_name,
-                    "paid_for_by": None,
-                    "body": body,
-                    "start_date": start_date,
-                    "library_id": library_id,
-                    "platforms": None,
-                    "image_url": None,
-                    "screenshot_bytes": None,
-                })
-
-            if len(ads) >= 50:
-                break
-
-        return ads
-    except Exception:
-        return []
-
-
 def _extract_ad_from_card(card, index: int) -> Optional[dict]:
-    """Extract ad information from a single card element."""
+    """Extract ad information from a single card element.
+
+    Captures: page name, body text, start date, library ID, platforms,
+    creative image URLs (not the profile pic), and carousel slide data
+    (headline, description, CTA, destination link).
+    """
     try:
         text = card.inner_text().strip()
         if not text:
@@ -561,12 +538,11 @@ def _extract_ad_from_card(card, index: int) -> Optional[dict]:
             elif line.startswith("Library ID:"):
                 library_id = line.replace("Library ID:", "").strip()
             elif "Sponsored" in line:
-                # The line before "Sponsored" is usually the page name
                 idx = lines.index(line)
                 if idx > 0:
                     page_name = lines[idx - 1]
 
-        # Find platforms line (contains platform icons text)
+        # Find platforms line
         for line in lines:
             if line == "Platforms":
                 continue
@@ -578,7 +554,8 @@ def _extract_ad_from_card(card, index: int) -> Optional[dict]:
         skip_patterns = [
             "Paid for by", "Started running", "Library ID:", "Sponsored",
             "See ad details", "About this ad", "Active", "Inactive",
-            "Platforms", "Categories", "Open Dropdown",
+            "Platforms", "Categories", "Open Dropdown", "Shop Now",
+            "Learn More", "Sign Up", "Download", "Book Now",
         ]
         non_meta = [
             l for l in lines
@@ -590,14 +567,13 @@ def _extract_ad_from_card(card, index: int) -> Optional[dict]:
         if non_meta:
             body = max(non_meta, key=len)
 
-        # Try to get an image
-        image_url = None
-        try:
-            img = card.query_selector("img[src*='scontent'], img[src*='fbcdn']")
-            if img:
-                image_url = img.get_attribute("src")
-        except Exception:
-            pass
+        # ----- Extract creative images (not profile pic) -----
+        # Profile pics: class contains "_8nqq", rendered ~32x32
+        # Creative images: rendered ~175x175, no alt text
+        creative_images = _extract_creative_images(card)
+
+        # ----- Extract carousel slides (headline, description, CTA, link) -----
+        carousel_slides = _extract_carousel_slides(card)
 
         return {
             "page_name": page_name,
@@ -606,12 +582,100 @@ def _extract_ad_from_card(card, index: int) -> Optional[dict]:
             "start_date": start_date,
             "library_id": library_id,
             "platforms": platforms,
-            "image_url": image_url,
+            "image_url": creative_images[0] if creative_images else None,
+            "creative_images": creative_images,
+            "carousel_cards": carousel_slides,
             "screenshot_bytes": None,
         }
     except Exception as e:
         logger.debug("Card extraction %d failed: %s", index, e)
         return None
+
+
+def _extract_creative_images(card) -> list:
+    """Extract ad creative image URLs from a card, filtering out profile pics.
+
+    Profile pics: class contains '_8nqq', natural size ~60x60
+    Creative images: natural size ~600x600, served from scontent/fbcdn
+    """
+    try:
+        img_data = card.evaluate('''(el) => {
+            const imgs = el.querySelectorAll('img');
+            const creatives = [];
+            for (const img of imgs) {
+                const isProfilePic = (
+                    img.className.includes('_8nqq') ||
+                    img.naturalWidth <= 80 ||
+                    (img.getBoundingClientRect().width <= 50 && img.alt)
+                );
+                if (!isProfilePic && img.src && (
+                    img.src.includes('scontent') || img.src.includes('fbcdn')
+                )) {
+                    creatives.push(img.src);
+                }
+            }
+            return creatives;
+        }''')
+        return img_data or []
+    except Exception:
+        return []
+
+
+def _extract_carousel_slides(card) -> list:
+    """Extract carousel slide data from <a> links in the card.
+
+    Each carousel slide is an <a> with text like:
+        DOMAIN.COM
+        Headline Text
+        Description Text
+        Shop Now
+
+    Returns list of {headline, description, cta, link_url}.
+    """
+    try:
+        slides = card.evaluate('''(el) => {
+            const links = el.querySelectorAll('a[href]');
+            const ctas = ['Shop Now', 'Learn More', 'Sign Up', 'Download',
+                          'Book Now', 'Contact Us', 'Get Offer', 'Apply Now',
+                          'Watch More', 'See Menu', 'Get Quote'];
+            const slides = [];
+            for (const link of links) {
+                const text = link.innerText.trim();
+                const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
+                // A carousel slide link typically has 3-5 lines:
+                // domain, headline, description, CTA
+                const hasCTA = lines.some(l => ctas.includes(l));
+                if (hasCTA && lines.length >= 2) {
+                    const ctaLine = lines.find(l => ctas.includes(l));
+                    const nonCTA = lines.filter(l => !ctas.includes(l));
+                    // First line is often the domain, skip it if it looks like a URL
+                    let headline = null;
+                    let description = null;
+                    for (const line of nonCTA) {
+                        if (line.includes('.COM') || line.includes('.com') ||
+                            line.includes('.NET') || line.includes('.ORG') ||
+                            line.length < 4) continue;
+                        if (!headline) {
+                            headline = line;
+                        } else if (!description) {
+                            description = line;
+                        }
+                    }
+                    if (headline) {
+                        slides.push({
+                            headline: headline,
+                            description: description,
+                            cta: ctaLine || null,
+                            link_url: link.href || null,
+                        });
+                    }
+                }
+            }
+            return slides;
+        }''')
+        return slides or []
+    except Exception:
+        return []
 
 
 def _error_result(msg: str) -> dict:
