@@ -5,12 +5,21 @@ Uses Playwright to interact with the Ad Library's required flow:
 2. Select "All ads" from the Ad Category dropdown
 3. Type search term and click the advertiser suggestion (or press Enter)
 4. Scroll to load ads, extract card data
+
+NOTE: Playwright's sync_playwright() cannot run inside Streamlit's event loop
+on Windows (asyncio subprocess creation raises NotImplementedError). To work
+around this, we spawn the Playwright work in a child process via
+multiprocessing.
 """
 
+import json
 import logging
+import multiprocessing
 import random
 import re
+import tempfile
 import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
@@ -32,35 +41,15 @@ def scrape_facebook_ads(
 ) -> dict:
     """Scrape Facebook Ad Library for a brand.
 
-    Args:
-        brand_name: e.g. "Nike"
-        domain: e.g. "nike.com"
-        max_ads: cap on ads to return
-        progress_cb: optional callback(status_str)
-        google_advertiser_name: advertiser name from Google (used as search hint)
-
-    Returns:
-        {
-            "ads": [{page_name, paid_for_by, body, start_date, platforms,
-                      library_id, image_url, screenshot_bytes}],
-            "total_found": int,
-            "source": "playwright",
-            "error": str | None,
-            "search_term_used": str | None,
-            "fb_page_id": str | None,
-        }
+    Spawns a child process to run Playwright (avoids Streamlit's asyncio
+    event-loop conflict on Windows).
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return _error_result("Playwright not installed")
-
     search_terms = _build_search_terms(brand_name, domain, google_advertiser_name)
     _status(progress_cb, f"Will try Facebook searches: {search_terms}")
 
     for search_term in search_terms:
         _status(progress_cb, f"Searching Facebook Ad Library for '{search_term}'...")
-        result = _try_facebook_search(search_term, max_ads, progress_cb)
+        result = _run_in_subprocess(search_term, max_ads, progress_cb)
 
         if result.get("ads"):
             result["search_term_used"] = search_term
@@ -83,6 +72,60 @@ def scrape_facebook_ads(
             f"Try manually: {AD_LIBRARY_URL}"
         ),
     }
+
+
+def _run_in_subprocess(search_term: str, max_ads: int, progress_cb) -> dict:
+    """Run the Playwright scraper in a completely separate Python process.
+
+    This avoids the Windows asyncio NotImplementedError that occurs when
+    Playwright tries to spawn a subprocess inside Streamlit's event loop.
+    We use subprocess.Popen (not multiprocessing) for maximum isolation.
+    """
+    import subprocess, sys
+
+    result_file = Path(tempfile.mktemp(suffix=".json", prefix="fb_result_"))
+    this_file = Path(__file__).resolve()
+
+    # Build a small Python script that imports this module and runs the search
+    script = (
+        f"import sys, json; sys.path.insert(0, {str(this_file.parent.parent)!r});\n"
+        f"from core.facebook_scraper import _try_facebook_search;\n"
+        f"r = _try_facebook_search({search_term!r}, {max_ads!r}, None);\n"
+        f"[a.pop('screenshot_bytes', None) or a.pop('thumbnail_bytes', None) for a in r.get('ads', [])];\n"
+        f"open({str(result_file)!r}, 'w', encoding='utf-8').write(json.dumps(r, default=str, ensure_ascii=False))\n"
+    )
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Poll for completion, updating the progress callback
+        elapsed = 0
+        while proc.poll() is None and elapsed < 120:
+            time.sleep(3)
+            elapsed += 3
+            if progress_cb:
+                _status(progress_cb, f"Facebook: scraping '{search_term}' ({elapsed}s)...")
+
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+            return _error_result("Facebook scraping timed out after 120s")
+
+        if not result_file.exists():
+            stderr = proc.stderr.read().decode("utf-8", errors="replace")[:500]
+            return _error_result(f"Facebook subprocess failed (exit {proc.returncode}): {stderr}")
+
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        return data
+
+    except Exception as e:
+        return _error_result(f"Failed to launch Facebook subprocess: {e}")
+    finally:
+        result_file.unlink(missing_ok=True)
 
 
 def _build_search_terms(brand_name: str, domain: str, google_advertiser_name: str = None) -> list:
