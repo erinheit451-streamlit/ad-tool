@@ -16,6 +16,7 @@ from core.google_scraper import scrape_google_ads
 from core.facebook_scraper import scrape_facebook_ads
 from core.screenshot_manager import download_ad_images
 from core.agency_detector import detect_agency, analyze_all_ads
+from core.tech_scanner import scan_website_tech
 
 # ---------------------------------------------------------------------------
 # Helper functions (defined before use)
@@ -101,6 +102,7 @@ max_facebook = col_f.slider("Max Facebook ads", 5, 100, 30, step=5)
 
 run_google = st.sidebar.checkbox("Search Google Ads Transparency", value=True)
 run_facebook = st.sidebar.checkbox("Search Facebook Ad Library", value=True)
+run_techscan = st.sidebar.checkbox("Scan Website Tech Stack", value=True)
 
 run_btn = st.sidebar.button("Generate Report", type="primary", use_container_width=True)
 
@@ -140,10 +142,11 @@ status = st.empty()
 # Collect results
 google_result = None
 facebook_result = None
+tech_result = None
 google_agency = None
 facebook_agency = None
 
-total_steps = int(run_google) + int(run_facebook) + 1  # +1 for summary
+total_steps = int(run_google) + int(run_facebook) + int(run_techscan) + 1
 step = 0
 
 
@@ -206,6 +209,23 @@ if run_facebook:
             paid_for_by=first_ad.get("paid_for_by"),
         )
 
+# --- Tech Scan ---
+if run_techscan:
+    step += 1
+    progress.progress(step / total_steps, "Scanning website tech stack...")
+    try:
+        tech_result = scan_website_tech(
+            url=f"https://{domain}",
+            progress_cb=update_status,
+        )
+    except Exception as e:
+        import traceback
+        tech_result = {
+            "techs": [],
+            "by_category": {},
+            "error": f"Exception: {e}\n{traceback.format_exc()}",
+        }
+
 progress.progress(1.0, "Report complete.")
 status.empty()
 
@@ -216,11 +236,12 @@ status.empty()
 st.markdown("---")
 st.subheader("Summary")
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 
 google_count = len(google_result["ads"]) if google_result else 0
 facebook_count = len(facebook_result["ads"]) if facebook_result else 0
 total_ads = google_count + facebook_count
+tech_count = len(tech_result["techs"]) if tech_result else 0
 
 # Count agency flags
 agency_flags = 0
@@ -257,6 +278,14 @@ with m3:
 with m4:
     st.markdown(f"""
     <div class="metric-card">
+        <div class="metric-value">{tech_count}</div>
+        <div class="metric-label">Technologies</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with m5:
+    st.markdown(f"""
+    <div class="metric-card">
         <div class="metric-value">{agency_flags}</div>
         <div class="metric-label">Agency Flags</div>
     </div>
@@ -284,7 +313,7 @@ if not google_agency and not facebook_agency:
 
 st.markdown("---")
 
-tab_google, tab_facebook = st.tabs(["Google Ads", "Facebook Ads"])
+tab_google, tab_facebook, tab_tech = st.tabs(["Google Ads", "Facebook Ads", "Tech Stack"])
 
 # --- Google Ads tab ---
 with tab_google:
@@ -421,6 +450,66 @@ with tab_facebook:
     else:
         st.info("No Facebook ads found for this brand.")
 
+# --- Tech Stack tab ---
+with tab_tech:
+    if not run_techscan:
+        st.info("Tech stack scan was not enabled.")
+    elif tech_result and tech_result.get("error"):
+        st.markdown(
+            f'<div class="error-box">Tech scan: {tech_result["error"]}</div>',
+            unsafe_allow_html=True,
+        )
+    elif tech_result and tech_result.get("techs"):
+        st.markdown(f"**{tech_count} technologies detected** on `{domain}`")
+
+        # Display by category in BDR-priority order
+        category_icons = {
+            "Ad Platforms": "&#128200;",       # chart
+            "Agency Indicators": "&#9888;",    # warning
+            "Analytics": "&#128202;",          # bar chart
+            "Tag Management": "&#127991;",     # label
+            "Marketing / CRM": "&#128231;",    # email
+            "Chat / Support": "&#128172;",     # speech
+            "CMS / E-commerce": "&#128187;",   # computer
+            "Other Tech": "&#9881;",           # gear
+        }
+        category_colors = {
+            "Ad Platforms": "#1a73e8",
+            "Agency Indicators": "#ffc107",
+            "Analytics": "#34a853",
+            "Tag Management": "#673ab7",
+            "Marketing / CRM": "#e91e63",
+            "Chat / Support": "#00bcd4",
+            "CMS / E-commerce": "#ff5722",
+            "Other Tech": "#607d8b",
+        }
+
+        for cat in [
+            "Ad Platforms", "Agency Indicators", "Analytics",
+            "Tag Management", "Marketing / CRM", "Chat / Support",
+            "CMS / E-commerce", "Other Tech",
+        ]:
+            techs_in_cat = tech_result["by_category"].get(cat, [])
+            if not techs_in_cat:
+                continue
+
+            color = category_colors.get(cat, "#607d8b")
+            icon = category_icons.get(cat, "&#9881;")
+            st.markdown(
+                f'<div style="border-left: 4px solid {color}; padding: 4px 12px; '
+                f'margin: 16px 0 8px 0; font-weight: 700; font-size: 1.05rem;">'
+                f'{icon} {cat} ({len(techs_in_cat)})</div>',
+                unsafe_allow_html=True,
+            )
+
+            for tech in techs_in_cat:
+                version_str = f" `v{tech['version']}`" if tech.get("version") else ""
+                note = tech.get("bdr_note", "")
+                note_str = f" — *{note}*" if note else ""
+                st.markdown(f"- **{tech['name']}**{version_str}{note_str}")
+    else:
+        st.info("No technologies detected.")
+
 # ---------------------------------------------------------------------------
 # JSON download
 # ---------------------------------------------------------------------------
@@ -434,6 +523,7 @@ report_data = {
     "generated_at": datetime.now().isoformat(),
     "google": _serialize_result(google_result) if google_result else None,
     "facebook": _serialize_result(facebook_result) if facebook_result else None,
+    "tech_stack": tech_result if tech_result else None,
     "agency_detection": {
         "google": google_agency,
         "facebook": facebook_agency,
