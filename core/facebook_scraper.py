@@ -243,7 +243,10 @@ def _try_facebook_search(search_term: str, max_ads: int, progress_cb) -> dict:
     try:
         with sync_playwright() as p:
             _dbg("Playwright started")
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
             ctx = browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent=(

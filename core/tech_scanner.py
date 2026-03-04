@@ -330,7 +330,10 @@ def _playwright_tag_scan(url: str) -> list:
     network_urls = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
         ctx = browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(

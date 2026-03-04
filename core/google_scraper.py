@@ -398,7 +398,10 @@ def _scrape_via_playwright(domain: str, max_ads: int, progress_cb) -> dict:
     try:
         _status(progress_cb, "Launching browser for Google Ads Transparency...")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
             ctx = browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent=(

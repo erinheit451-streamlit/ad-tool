@@ -6,6 +6,7 @@ ads are managed by an agency or in-house.
 """
 
 import json
+import subprocess
 import time
 from datetime import datetime
 
@@ -17,6 +18,18 @@ from core.facebook_scraper import scrape_facebook_ads
 from core.screenshot_manager import download_ad_images
 from core.agency_detector import detect_agency, analyze_all_ads
 from core.tech_scanner import scan_website_tech
+
+
+@st.cache_resource
+def _install_playwright_chromium():
+    """Download the Chromium browser binary (once per app boot)."""
+    subprocess.run(
+        ["playwright", "install", "chromium"],
+        check=True,
+    )
+
+
+_install_playwright_chromium()
 
 # ---------------------------------------------------------------------------
 # Helper functions (defined before use)

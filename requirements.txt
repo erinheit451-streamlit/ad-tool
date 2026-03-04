@@ -1,5 +1,5 @@
 streamlit>=1.28.0
-playwright>=1.40.0
+playwright==1.49.0
 requests>=2.31.0
 tldextract>=5.0.0
 Pillow>=10.0.0
