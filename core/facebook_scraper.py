@@ -47,6 +47,7 @@ def scrape_facebook_ads(
     search_terms = _build_search_terms(brand_name, domain, google_advertiser_name)
     _status(progress_cb, f"Will try Facebook searches: {search_terms}")
 
+    per_term_errors = []
     for search_term in search_terms:
         _status(progress_cb, f"Searching Facebook Ad Library for '{search_term}'...")
         result = _run_in_subprocess(search_term, max_ads, progress_cb)
@@ -60,7 +61,10 @@ def scrape_facebook_ads(
             result["search_term_used"] = search_term
             return result
 
+        per_term_errors.append(f'"{search_term}": {result.get("error", "no ads")}')
+
     all_terms = ", ".join(f'"{t}"' for t in search_terms)
+    detail = " | ".join(per_term_errors)
     return {
         "ads": [],
         "total_found": 0,
@@ -69,6 +73,7 @@ def scrape_facebook_ads(
         "fb_page_id": None,
         "error": (
             f"No ads found after trying: {all_terms}. "
+            f"Per-term errors: {detail}. "
             f"Try manually: {AD_LIBRARY_URL}"
         ),
     }
@@ -261,48 +266,18 @@ def _try_facebook_search(search_term: str, max_ads: int, progress_cb) -> dict:
             )
             page = ctx.new_page()
 
-            # Step 1: Load the Ad Library
-            _status(progress_cb, "Loading Facebook Ad Library...")
-            page.goto(AD_LIBRARY_URL, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(4)
+            # Navigate directly to keyword search results URL
+            # (bypasses fragile dropdown / autocomplete UI interaction)
+            _status(progress_cb, f"Searching Facebook Ad Library for '{search_term}'...")
+            search_url = (
+                f"{AD_LIBRARY_URL}"
+                f"?active_status=active&ad_type=all&country=US"
+                f"&q={quote_plus(search_term)}&search_type=keyword_unordered"
+            )
+            _dbg(f"Navigating to: {search_url}")
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(6)
             _dbg(f"Page loaded, URL: {page.url}")
-
-            # Step 2: Select "All ads" from the Ad Category dropdown
-            _status(progress_cb, "Selecting 'All ads' category...")
-            cat_ok = _select_all_ads_category(page)
-            _dbg(f"Category select result: {cat_ok}")
-            if not cat_ok:
-                browser.close()
-                return _error_result("Could not find Ad Category dropdown")
-
-            time.sleep(2)
-
-            # Step 3: Type search term and look for advertiser autocomplete
-            _status(progress_cb, f"Searching for '{search_term}'...")
-            search_input = page.query_selector('input[type="search"]')
-            if not search_input:
-                search_input = page.query_selector(
-                    'input[placeholder*="keyword"], input[placeholder*="advertiser"]'
-                )
-            _dbg(f"Search input found: {search_input is not None}")
-            if not search_input:
-                browser.close()
-                return _error_result("Search box not found after selecting category")
-
-            search_input.click()
-            time.sleep(0.5)
-            search_input.fill(search_term)
-            time.sleep(3)
-
-            # Step 4: Try to click the advertiser suggestion
-            clicked_advertiser = _click_advertiser_suggestion(page, search_term)
-            _dbg(f"Clicked advertiser suggestion: {clicked_advertiser}")
-
-            if not clicked_advertiser:
-                _status(progress_cb, "No advertiser match, doing keyword search...")
-                search_input.press("Enter")
-
-            time.sleep(5)
 
             url = page.url
             _dbg(f"URL after search: {url}")
